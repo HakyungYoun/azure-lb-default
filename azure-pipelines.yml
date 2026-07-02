@@ -78,7 +78,7 @@ stages:
               cat > backend.hcl <<EOF
               path = "$(STATE_DIR)/terraform.tfstate"
               EOF
-              } 2>error.log
+              } 2> >(tee error.log >&2)
             displayName: 'Prepare TFVars'
 
   - stage: Init
@@ -95,7 +95,7 @@ stages:
                 set -e
                 cd $(WORK_DIR)
                 # 💡 에러가 나면 자동으로 여기서 파이프라인이 멈추고 error.log가 보존됩니다.
-                terraform init -backend-config="backend.hcl" 2>error.log
+                terraform init -backend-config="backend.hcl" 2> >(tee error.log >&2)
             displayName: 'Terraform Init'
 
   - stage: Plan
@@ -111,7 +111,7 @@ stages:
               inlineScript: |
                 set -e
                 cd $(WORK_DIR)
-                terraform plan -var-file=$(VAR_FILE) -out=tfplan 2>error.log
+                terraform plan -var-file=$(VAR_FILE) -out=tfplan 2> >(tee error.log >&2)
                 terraform show -json tfplan > tfplan.json
             displayName: 'Terraform Plan'
 
@@ -141,7 +141,7 @@ stages:
                   "planResult": "${PLAN_JSON}"
                 }
                 EOF
-                } 2>$(WORK_DIR)/error.log
+                } 2> >(tee "$(WORK_DIR)/error.log" >&2)
 
   - stage: Apply
     dependsOn: Plan
@@ -160,7 +160,7 @@ stages:
                     inlineScript: |
                       set -e
                       cd $(WORK_DIR)
-                      terraform apply -auto-approve tfplan 2>error.log
+                      terraform apply -auto-approve tfplan 2> >(tee error.log >&2)
                       cp $(VAR_FILE) $(STATE_DIR)/$(VAR_FILE)
                   displayName: 'Terraform Apply'
 
