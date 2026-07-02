@@ -45,6 +45,7 @@ resource "azurerm_lb" "lb" {
   location            = data.azurerm_resource_group.rg[each.value.resource_group_name].location
   resource_group_name = data.azurerm_resource_group.rg[each.value.resource_group_name].name
   sku                 = "Standard"
+  tags                = each.value.tags
 
   dynamic "frontend_ip_configuration" {
     for_each = each.value.frontend_configs

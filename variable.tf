@@ -23,6 +23,8 @@ variable "load_balancers" {
       config_name = string
       pip_name    = string
     }))
+    
+    tags = optional(map(string), {})
   }))
   default = {}
 }
