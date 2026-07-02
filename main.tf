@@ -19,11 +19,15 @@ locals {
     }
   ]...)
 
-  # probe가 있는 LB만 추려서 LB key 기준 map으로
-  lbs_with_probe = {
-    for lb_key, lb in var.load_balancers : lb_key => lb.lb_settings.probe
-    if lb.lb_settings.probe != null
-  }
+  # probes를 "lb_key.probe_key" 형태로 펼침
+  flattened_probes = merge([
+    for lb_key, lb in var.load_balancers : {
+      for probe_key, probe in lb.lb_settings.probes :
+      "${lb_key}.${probe_key}" => merge(probe, {
+        lb_key = lb_key
+      })
+    }
+  ]...)
 }
 
 # 1. 공인 IP
@@ -64,11 +68,11 @@ resource "azurerm_lb_backend_address_pool" "backend" {
   name            = each.value.lb_settings.backend_pool_name
 }
 
-# 4. 상태 검사 (probe가 있는 LB만)
+# 4. 상태 검사 (LB마다 여러 개 가능)
 resource "azurerm_lb_probe" "probe" {
-  for_each = local.lbs_with_probe
+  for_each = local.flattened_probes
 
-  loadbalancer_id = azurerm_lb.lb[each.key].id
+  loadbalancer_id = azurerm_lb.lb[each.value.lb_key].id
   name            = each.value.name
   port            = each.value.port
 }
@@ -84,5 +88,6 @@ resource "azurerm_lb_rule" "rules" {
   backend_port                    = each.value.backend_port
   frontend_ip_configuration_name = each.value.frontend_ip_configuration_name
   backend_address_pool_ids       = [azurerm_lb_backend_address_pool.backend[each.value.lb_key].id]
-  probe_id                        = try(azurerm_lb_probe.probe[each.value.lb_key].id, null)
+  # rule에 probe_key가 지정된 경우에만 해당 probe 연결
+  probe_id = each.value.probe_key != null ? azurerm_lb_probe.probe["${each.value.lb_key}.${each.value.probe_key}"].id : null
 }

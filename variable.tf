@@ -5,16 +5,18 @@ variable "load_balancers" {
     lb_settings = object({
       name              = string
       backend_pool_name = string
-      probe = optional(object({
+      # probe를 여러 개 설정할 수 있도록 map으로 변경
+      probes = optional(map(object({
         name = string
         port = number
-      }))
+      })), {})
       rules = map(object({
         name                           = string
         protocol                       = string
         frontend_port                  = number
         backend_port                   = number
         frontend_ip_configuration_name = string
+        probe_key                      = optional(string) # 연결할 probe의 key (선택)
       }))
     })
 
