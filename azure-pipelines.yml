@@ -1,0 +1,213 @@
+trigger: none
+
+parameters:
+  - name: REQUEST_ID
+    type: string
+  - name: PROJECT
+    type: string
+  - name: ACTION
+    type: string
+  - name: ENV
+    type: string
+  - name: VARIABLE
+    type: string
+
+pool:
+  name: 'skr-azure-pipeline'
+
+variables:
+  - group: terraform-loadbalancer
+  - name: WORK_DIR
+    value: '$(BASE_DIR)/runs/${{ parameters.REQUEST_ID }}'
+  - name: STATE_DIR
+    value: '$(BASE_DIR)/state/${{ parameters.ENV }}/${{ parameters.PROJECT }}/$(STACK)'
+  - name: VAR_FILE
+    value: 'lb.auto.tfvars.json'
+
+stages:
+  - stage: Prepare
+    jobs:
+      - job: MergeVariables
+        steps:
+          - checkout: self
+
+          - script: |
+              # 파일 경로 설정
+              mkdir -p $(WORK_DIR) $(STATE_DIR)
+              cd $(WORK_DIR)
+              
+              # 💡 실패하면 자동으로 멈추되, 에러 내용만 error.log에 덮어씁니다.
+              {
+              cat << 'EOF' > terraform.tfvars.json
+              ${{ parameters.VARIABLE }}
+              EOF
+              
+              mv $(Build.SourcesDirectory)/* $(WORK_DIR)
+              
+              # 기존 State 파일 확인
+              STATE_FILE="$(STATE_DIR)/$(VAR_FILE)"
+              if [ -f "$STATE_FILE" ]; then
+                cp "$STATE_FILE" $(WORK_DIR)/merged.json
+              else
+                echo '{"load_balancers":{}}' > $(WORK_DIR)/merged.json
+              fi
+              
+              # Variable 병합을 위한 키 추출
+              jq -c '.load_balancers[] | "\(.resource_group_name)__\(.lb_settings.name)"' terraform.tfvars.json > lb-keys.txt
+              
+              # Variable 병합
+              while read -r target_key; do
+                  target_key=$(echo "$target_key" | jq -r .)
+                  if [ "${{ parameters.ACTION }}" = "delete" ]; then
+                      jq --arg k "$target_key" \
+                          '.load_balancers |= with_entries(select(("\(.value.resource_group_name)__\(.value.lb_settings.name)") != $k))' \
+                          merged.json > tmp.json && mv tmp.json merged.json
+                  else
+                      spec=$(jq -c --arg k "$target_key" \
+                        '.load_balancers[] | select("\(.resource_group_name)__\(.lb_settings.name)" == $k)' \
+                          terraform.tfvars.json)
+                      jq --arg k "$target_key" --argjson spec "$spec" \
+                          '.load_balancers |= (with_entries(select(("\(.value.resource_group_name)__\(.value.lb_settings.name)") != $k)) + {($k): $spec})' \
+                          merged.json > tmp.json && mv tmp.json merged.json
+                  fi
+              done < lb-keys.txt
+
+              mv merged.json $(VAR_FILE)
+              
+              cat > backend.hcl <<EOF
+              path = "$(STATE_DIR)/terraform.tfstate"
+              EOF
+              } 2>error.log
+            displayName: 'Prepare TFVars'
+
+  - stage: Init
+    dependsOn: Prepare
+    jobs:
+      - job: TerraformInit
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: 'SKR-Service-Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd $(WORK_DIR)
+                # 💡 에러가 나면 자동으로 여기서 파이프라인이 멈추고 error.log가 보존됩니다.
+                terraform init -backend-config="backend.hcl" 2>error.log
+            displayName: 'Terraform Init'
+
+  - stage: Plan
+    dependsOn: Init
+    jobs:
+      - job: TerraformPlan
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: 'SKR-Service-Connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd $(WORK_DIR)
+                terraform plan -var-file=$(VAR_FILE) -out=tfplan 2>error.log
+                terraform show -json tfplan > tfplan.json
+            displayName: 'Terraform Plan'
+
+  - stage: NotifyPlanSuccess
+    displayName: 'Notify Plan Success'
+    dependsOn: Plan
+    condition: succeeded('Plan')
+    jobs:
+      - job: SendPlanResult
+        steps:
+          - task: Bash@3
+            displayName: 'Send Plan Result'
+            inputs:
+              targetType: 'inline'
+              script: |
+                {
+                PLAN_JSON=$(cat $(WORK_DIR)/tfplan.json | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | tr '\n' ' ' | tr '\t' ' ')
+
+                curl -X POST "http://13.124.121.66:8000/api/plan/success" \
+                  -H "Content-Type: application/json" \
+                  -d @- <<EOF
+                {
+                  "pipelineId": "$(Build.BuildId)",
+                  "status": "plan_success",
+                  "requestId": "${{ parameters.REQUEST_ID }}",
+                  "planResult": "${PLAN_JSON}"
+                }
+                EOF
+                } 2>$(WORK_DIR)/error.log
+
+  - stage: Apply
+    dependsOn: Plan
+    jobs:
+      - deployment: ApplyJob
+        environment: terraform-apply-approval
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: 'SKR-Service-Connection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd $(WORK_DIR)
+                      terraform apply -auto-approve tfplan 2>error.log
+                      cp $(VAR_FILE) $(STATE_DIR)/$(VAR_FILE)
+                  displayName: 'Terraform Apply'
+
+  - stage: NotifyApplySuccess
+    displayName: 'Notify Success'
+    dependsOn: Apply
+    condition: succeeded('Apply')
+    jobs:
+      - job: SendSuccess
+        steps:
+          - task: Bash@3
+            displayName: 'Notify Pipeline Success'
+            inputs:
+              targetType: 'inline'
+              script: |
+                curl -X POST "http://13.124.121.66:8000/api/pipeline/success" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"requestId\": \"${{ parameters.REQUEST_ID }}\"}"
+
+  # global error handler
+  - stage: HandleFailure
+    displayName: 'Global Error Handler'
+    dependsOn:
+      - Prepare
+      - Init
+      - Plan
+      - NotifyPlanSuccess
+      - Apply
+    condition: and(always(), failed())
+    jobs:
+      - job: SendErrorLog
+        steps:
+          - task: Bash@3
+            displayName: 'Notify Pipeline Failure with Local Logs'
+            inputs:
+              targetType: 'inline'
+              script: |
+                LOG_FILE="$(WORK_DIR)/error.log"
+                ERROR_MSG="상세 에러 로그 파일이 없습니다. Azure DevOps 콘솔을 확인하세요."
+                
+                if [ -f "$LOG_FILE" ]; then
+                  ERROR_MSG=$(cat "$LOG_FILE" | sed 's/"/\\"/g' | tr '\n' ' ')
+                fi
+                
+                curl -X POST "http://13.124.121.66:8000/api/pipeline/failed" \
+                  -H "Content-Type: application/json" \
+                  -d @- <<EOF
+                {
+                  "pipelineId": "$(Build.BuildId)",
+                  "status": "failed",
+                  "failedStage": "$(System.StageName)",
+                  "requestId": "${{ parameters.REQUEST_ID }}",
+                  "errorMessage": "${ERROR_MSG}"
+                }
+                EOF
