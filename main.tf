@@ -39,6 +39,10 @@ resource "azurerm_public_ip" "pips" {
   resource_group_name = data.azurerm_resource_group.rg[var.load_balancers[each.value.lb_key].resource_group_name].name
   allocation_method   = "Static"
   sku                 = "Standard"
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # 2. 로드밸런서 본체 (LB마다 1개씩)
@@ -77,7 +81,16 @@ resource "azurerm_lb_probe" "probe" {
   port            = each.value.port
 }
 
-# 5. 부하 분산 규칙 (LB마다 여러 개 가능)
+# 5-1. rule이 참조하는 frontend config 이름 추적용
+# frontend_ip_configuration_name 값이 바뀌면 이 리소스가 교체되고,
+# 아래 rule의 replace_triggered_by가 발동해 rule도 교체(재생성)된다.
+resource "terraform_data" "rule_frontend_ref" {
+  for_each = local.flattened_rules
+
+  input = each.value.frontend_ip_configuration_name
+}
+
+# 5-2. 부하 분산 규칙 (LB마다 여러 개 가능)
 resource "azurerm_lb_rule" "rules" {
   for_each = local.flattened_rules
 
@@ -90,4 +103,10 @@ resource "azurerm_lb_rule" "rules" {
   backend_address_pool_ids       = [azurerm_lb_backend_address_pool.backend[each.value.lb_key].id]
   # rule에 probe_key가 지정된 경우에만 해당 probe 연결
   probe_id = each.value.probe_key != null ? azurerm_lb_probe.probe["${each.value.lb_key}.${each.value.probe_key}"].id : null
+
+  lifecycle {
+    replace_triggered_by = [
+      terraform_data.rule_frontend_ref[each.key]
+    ]
+  }
 }
