@@ -189,12 +189,41 @@ resource "azurerm_lb_rule" "rules" {
   # 포털 "부하 분산 규칙 추가" 화면의 옵션들
   load_distribution       = each.value.load_distribution       # 세션 지속성
   idle_timeout_in_minutes = each.value.idle_timeout_in_minutes # 유휴 시간 제한(분)
-  enable_tcp_reset        = each.value.enable_tcp_reset        # TCP 재설정 사용
-  enable_floating_ip      = each.value.enable_floating_ip      # 부동 IP 사용
+  tcp_reset_enabled        = each.value.enable_tcp_reset        # TCP 재설정 사용
+  floating_ip_enabled      = each.value.enable_floating_ip      # 부동 IP 사용
 
   lifecycle {
     replace_triggered_by = [
       terraform_data.rule_frontend_ref[each.key]
     ]
   }
+}
+
+# ---------------------------------------------------------------------------
+# 6. IAM 역할 할당
+# 각 LB 항목의 iam 맵을 "lb_key.할당키" 단일 맵으로 평탄화해서 for_each.
+# scope가 LB 리소스를 직접 참조하므로 destroy 시 할당 -> LB 순으로
+# 정리되어 고아 롤 할당이 남지 않는다.
+# 사전 조건: 실행 주체(SP)에 해당 스코프의 Owner 또는
+#            User Access Administrator 역할 필요 (Contributor만으로는 403)
+# ---------------------------------------------------------------------------
+locals {
+  flattened_iam = merge([
+    for lb_key, lb in var.load_balancers : {
+      for iam_key, a in lb.iam :
+      "${lb_key}.${iam_key}" => {
+        lb_key               = lb_key
+        principal_id         = a.principal_id
+        role_definition_name = a.role_definition_name
+      }
+    }
+  ]...)
+}
+
+resource "azurerm_role_assignment" "lb" {
+  for_each = local.flattened_iam
+
+  scope                = azurerm_lb.lb[each.value.lb_key].id
+  role_definition_name = each.value.role_definition_name
+  principal_id         = each.value.principal_id
 }
