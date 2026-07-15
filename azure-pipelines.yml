@@ -208,17 +208,16 @@ stages:
                 ERROR_MSG="상세 에러 로그 파일이 없습니다. Azure DevOps 콘솔을 확인하세요."
                 
                 if [ -f "$LOG_FILE" ]; then
-                  ERROR_MSG=$(cat "$LOG_FILE" | sed 's/"/\\"/g' | tr '\n' ' ')
+                  ERROR_MSG=$(sed 's/\x1b\[[0-9;]*m//g' "$LOG_FILE")
                 fi
                 
-                curl -X POST "http://13.124.121.66:8000/api/pipeline/failed" \
-                  -H "Content-Type: application/json" \
-                  -d @- <<EOF
-                {
-                  "pipelineId": "$(Build.BuildId)",
-                  "status": "failed",
-                  "failedStage": "$(System.StageName)",
-                  "requestId": "${{ parameters.REQUEST_ID }}",
-                  "errorMessage": "${ERROR_MSG}"
-                }
-                EOF
+                jq -n \
+                  --arg pipelineId "$(Build.BuildId)" \
+                  --arg status "failed" \
+                  --arg failedStage "$(System.StageName)" \
+                  --arg requestId "${{ parameters.REQUEST_ID }}" \
+                  --arg errorMessage "$ERROR_MSG" \
+                  '{pipelineId: $pipelineId, status: $status, failedStage: $failedStage, requestId: $requestId, errorMessage: $errorMessage}' \
+                | curl --fail -X POST "http://13.124.121.66:8000/api/pipeline/failed" \
+                -H "Content-Type: application/json" \
+                -d @-
